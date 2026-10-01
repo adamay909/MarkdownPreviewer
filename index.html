@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markdown Previewer</title>
+<meta name="theme-color" content="#1f3d3a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <span id="filename" class="none">No file open</span>
+  <button id="open" >Open file</button>
+  <button id="copy-rich" disabled>Copy formatted text</button>
+  <button id="copy-html" disabled>Copy HTML</button>
+  <button id="copy-md" disabled>Copy Markdown</button>
+</header>
+<main>
+  <div id="empty">
+    <p>Open a Markdown file, or drop one here, to preview it. The preview refreshes whenever you save the file in your editor.</p>
+  </div>
+  <article id="preview" hidden></article>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@18.0.14/lib/marked.umd.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const preview = $('preview'), toast = $('toast');
+  let handle = null, lastModified = 0, source = '', html = '', timer = null;
+
+  function say(msg) {
+    toast.textContent = msg; toast.classList.add('show');
+    clearTimeout(say.t); say.t = setTimeout(() => toast.classList.remove('show'), 1600);
+  }
+
+  function render(md) {
+    source = md;
+    html = DOMPurify.sanitize(marked.parse(md, { gfm: true }));
+    preview.innerHTML = html;
+    preview.hidden = false; $('empty').hidden = true;
+  }
+
+  function show(name) {
+    const n = $('filename'); n.textContent = name; n.classList.remove('none');
+    document.title = name + ' \u2013 Markdown Previewer';
+    for (const id of ['copy-rich', 'copy-html', 'copy-md']) $(id).disabled = false;
+  }
+
+  async function load(h) {
+    const file = await h.getFile();
+    lastModified = file.lastModified;
+    handle = h;
+    render(await file.text());
+    show(file.name);
+    clearInterval(timer);
+    timer = setInterval(poll, 1000);
+  }
+
+  // Fallback when a drop gives a plain File instead of a handle: shown once, no live refresh.
+  async function loadStatic(file) {
+    handle = null; clearInterval(timer);
+    render(await file.text());
+    show(file.name);
+  }
+
+  // Re-read the file when it changes on disk (edited in another app).
+  async function poll() {
+    if (!handle) return;
+    try {
+      const file = await handle.getFile();
+      if (file.lastModified !== lastModified) {
+        lastModified = file.lastModified;
+        const y = document.querySelector('main').scrollTop;
+        render(await file.text());
+        document.querySelector('main').scrollTop = y;
+      }
+    } catch (e) {
+      clearInterval(timer);
+      say('Lost access to the file. Open it again.');
+    }
+  }
+
+  $('open').onclick = async () => {
+    if (!window.showOpenFilePicker) return say('File System Access API is not supported in this browser.');
+    try {
+      const [h] = await window.showOpenFilePicker({
+        types: [{ description: 'Markdown', accept: { 'text/markdown': ['.md', '.markdown', '.mdown', '.txt'] } }],
+      });
+      await load(h);
+    } catch (e) { if (e.name !== 'AbortError') say('Could not open the file.'); }
+  };
+
+  async function copy(fn, ok) {
+    try { await fn(); say(ok); } catch (e) { say('Copy failed: ' + e.message); }
+  }
+
+  $('copy-rich').onclick = () => copy(() => navigator.clipboard.write([new ClipboardItem({
+    'text/html': new Blob([html], { type: 'text/html' }),
+    'text/plain': new Blob([preview.innerText], { type: 'text/plain' }),
+  })]), 'Copied formatted text');
+  $('copy-html').onclick = () => copy(() => navigator.clipboard.writeText(html), 'Copied HTML');
+  $('copy-md').onclick = () => copy(() => navigator.clipboard.writeText(source), 'Copied Markdown');
+
+  // ---- Drag and drop ----
+  const zone = document.querySelector('main');
+  const isMarkdown = n => /\.(md|markdown|mdown|txt)$/i.test(n);
+  const hasFiles = e => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+  const highlight = on => { zone.style.outline = on ? '3px dashed var(--accent)' : ''; zone.style.outlineOffset = '-10px'; };
+  let depth = 0;
+
+  zone.addEventListener('dragenter', e => { if (!hasFiles(e)) return; e.preventDefault(); depth++; highlight(true); });
+  zone.addEventListener('dragover', e => { if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  zone.addEventListener('dragleave', e => { if (!hasFiles(e)) return; if (--depth <= 0) { depth = 0; highlight(false); } });
+  zone.addEventListener('drop', async e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); depth = 0; highlight(false);
+    const item = e.dataTransfer.items[0];
+    if (!item || item.kind !== 'file') return;
+    // Both must be requested synchronously; the item is invalid after the first await.
+    const handleP = item.getAsFileSystemHandle ? item.getAsFileSystemHandle() : null;
+    const plain = item.getAsFile();
+    try {
+      const h = handleP ? await handleP : null;
+      if (h && h.kind !== 'file') return say('Drop a file, not a folder.');
+      const name = h ? h.name : plain && plain.name;
+      if (!name || !isMarkdown(name)) return say('That is not a Markdown file.');
+      if (h) await load(h); else await loadStatic(plain);
+    } catch (err) { say('Could not open the dropped file.'); }
+  });
+  // Stop files dropped outside the preview area from navigating away from the app.
+  for (const type of ['dragover', 'drop']) {
+    window.addEventListener(type, e => {
+      if (!hasFiles(e) || zone.contains(e.target)) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = 'none';
+    });
+  }
+
+  // Open files handed to the installed app by the OS ("Open with…").
+  if ('launchQueue' in window) {
+    launchQueue.setConsumer(async p => { if (p.files && p.files.length) await load(p.files[0]); });
+  }
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+})();
+</script>
+</body>
+</html>
